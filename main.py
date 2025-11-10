@@ -104,6 +104,7 @@ def render_tracked_effect(
     seed: int | None,
     text_size: float,
     text_color: str | tuple[int, int, int],
+    remove_text: bool,
     no_fill: bool,
     ignore_audio: bool,
     video_threshold: float,
@@ -176,7 +177,7 @@ def render_tracked_effect(
                         s = min(s, max_box_size)
                     active.append(TrackedPoint((x, y), life_frames, s))
 
-            # --- Line Drawing Modes ---
+            # Line modes
             if line_mode != "none" and len(active) > 1:
                 coords = [tp.pos for tp in active]
                 for i, p in enumerate(coords):
@@ -184,16 +185,16 @@ def render_tracked_effect(
                         [(j, np.linalg.norm(p - coords[j])) for j in range(len(coords)) if j != i],
                         key=lambda x: x[1],
                     )
-                    if line_mode == "original":
+                    if line_mode == "all":
                         nearest = dists[:neighbor_links]
-                    elif line_mode == "nearby":
+                    elif line_mode == "near":
                         nearest = [d for d in dists if d[1] < 80][:neighbor_links]
                     else:
                         nearest = []
                     for j, _ in nearest:
                         cv2.line(frame, tuple(p.astype(int)), tuple(coords[j].astype(int)), (200, 200, 255), 1)
 
-            # --- Box Drawing & Text ---
+            # Draw boxes and text (if enabled)
             for tp in active:
                 x, y, s = *tp.pos, tp.size
                 tl, br = (max(0, int(x - s // 2)), max(0, int(y - s // 2))), (min(w - 1, int(x + s // 2)), min(h - 1, int(y + s // 2)))
@@ -204,15 +205,16 @@ def render_tracked_effect(
                         frame[tl[1]:br[1], tl[0]:br[0]] = 255 - roi
                 cv2.rectangle(frame, tl, br, (200, 200, 255), 1)
 
-                if color_mode_negative:
-                    roi = frame[max(0, tl[1] - 3):min(h, br[1] + 3), max(0, tl[0] - 3):min(w, br[0] + 3)]
-                    txt_color = _adaptive_contrast_color(roi)
-                else:
-                    txt_color = text_color
+                if not remove_text:
+                    if color_mode_negative:
+                        roi = frame[max(0, tl[1] - 3):min(h, br[1] + 3), max(0, tl[0] - 3):min(w, br[0] + 3)]
+                        txt_color = _adaptive_contrast_color(roi)
+                    else:
+                        txt_color = text_color
 
-                hex_text = f"0x{random.randint(0, 0xFFFFFFFF):08X}"
-                text_pos = (br[0] + 5, min(br[1], h - 10))
-                cv2.putText(frame, hex_text, text_pos, cv2.FONT_HERSHEY_SIMPLEX, text_size, txt_color, 1, cv2.LINE_AA)
+                    hex_text = f"0x{random.randint(0, 0xFFFFFFFF):08X}"
+                    text_pos = (br[0] + 5, min(br[1], h - 10))
+                    cv2.putText(frame, hex_text, text_pos, cv2.FONT_HERSHEY_SIMPLEX, text_size, txt_color, 1, cv2.LINE_AA)
 
             prev_gray = gray
             return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -234,10 +236,11 @@ def main():
     parser.add_argument("-t", "--text-size", type=float, default=0.4, help="Hex text size")
     parser.add_argument("-c", "--text-color", nargs="+", default=(255, 255, 255),
                         help='Text color (B G R) or "negative" for adaptive auto-contrast')
+    parser.add_argument("-r", "--remove-text", action="store_true", help="Remove text overlay entirely")
     parser.add_argument("-n", "--no-fill", action="store_true", help="Disable box inversion fill")
     parser.add_argument("-a", "--ignore-audio", action="store_true", help="Ignore audio and use video intensity threshold")
     parser.add_argument("-vth", "--video-threshold", type=float, default=1.0, help="Video intensity change threshold")
-    parser.add_argument("-l", "--line-mode", choices=["original", "none", "nearby"], default="original",
+    parser.add_argument("-l", "--line-mode", choices=["all", "none", "near"], default="all",
                         help="Connection line mode")
     parser.add_argument("-m", "--max-box-size", type=int, default=None, help="Set maximum box size (override)")
 
@@ -269,6 +272,7 @@ def main():
         seed=None,
         text_size=args.text_size,
         text_color=text_color,
+        remove_text=args.remove_text,
         no_fill=args.no_fill,
         ignore_audio=args.ignore_audio,
         video_threshold=args.video_threshold,

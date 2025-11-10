@@ -1,7 +1,4 @@
-# 🎬 Onset-Tracked Video Visualizer
-
-This Python script generates **reactive visual effects** on videos based on **audio beats** or **video motion intensity**.  
-It draws dynamic boxes, connecting lines, and hexadecimal text overlays that move and react to detected onsets.  
+BlobTrack is a simple Python-based implementation of blob tracking for videos, made without TouchDesigner and runs smoothly without requiring a GPU.
 
 The script supports:
 - 🧭 **Auto orientation** for portrait and landscape videos  
@@ -73,12 +70,13 @@ python3 main.py -i input.mp4 -o output.mp4
 | ------ | ------------------- | ------------- | -------------------------------------------------------------- |
 | `-i`   | `--input`           | *(required)*  | Input video file path                                          |
 | `-o`   | `--output`          | `output.mp4`  | Output video path                                              |
-| `-t`   | `--text-size`       | `0.4`         | Size of the random hexadecimal text                            |
+| `-t`   | `--text-size`       | `*(flag)*      | Remove text entirely                        |
+| `-r`   | `--remove-text`       | `0.4`         | Size of the random hexadecimal text                            |
 | `-c`   | `--text-color`      | `255 255 255` | Text color in B G R format, or `"negative"` for adaptive color |
 | `-n`   | `--no-fill`         | *(flag)*      | Disable box inversion (transparent boxes)                      |
 | `-a`   | `--ignore-audio`    | *(flag)*      | Ignore audio; use video intensity changes instead              |
 | `-vth` | `--video-threshold` | `1.0`         | Sensitivity for motion detection; higher = less sensitive      |
-| `-l`   | `--line-mode`       | `original`    | Connection line style: `original`, `none`, `nearby`            |
+| `-l`   | `--line-mode`       | `all`    | Connection line style: `all`, `none`, `near`            |
 | `-m`   | `--max-box-size`    | `None`        | Maximum allowed box size                                       |
 
 ---
