@@ -1,4 +1,5 @@
 input/
 output/
-.qwen/
 test/
+README.md.backup
+_pycache_/

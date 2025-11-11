@@ -48,6 +48,16 @@ def _detect_onsets_video(clip: VideoFileClip, threshold: float, fps_sample: int 
     return np.array(onsets, dtype=np.float32)
 
 
+def _detect_onsets_time_based(clip: VideoFileClip, interval: float) -> np.ndarray:
+    """Generate onsets at regular time intervals."""
+    onset_times = []
+    t = 0.0
+    while t < clip.duration:
+        onset_times.append(t)
+        t += interval
+    return np.array(onset_times, dtype=np.float32)
+
+
 def get_rotation(path: Path) -> int:
     """Read rotation metadata in degrees."""
     try:
@@ -61,7 +71,11 @@ def get_rotation(path: Path) -> int:
 
 
 class TrackedPoint:
+    _next_id = 0  # Class variable to generate unique IDs
+
     def __init__(self, pos: tuple[float, float], life: int, size: int, text_rate_ms: float = 0):
+        self.id = TrackedPoint._next_id
+        TrackedPoint._next_id += 1
         self.pos = np.array(pos, dtype=np.float32)
         self.life = life
         self.size = size
@@ -280,10 +294,10 @@ def _detect_edge_density(gray_frame, grid_size=32, threshold_factor=0.1):
     """Detect areas with high edge density using grid-based analysis."""
     # Apply Canny edge detection
     edges = cv2.Canny(gray_frame, 50, 150)
-    
+
     h, w = edges.shape
     keypoints = []
-    
+
     # Divide the frame into a grid and calculate edge density in each cell
     for y in range(0, h, grid_size):
         for x in range(0, w, grid_size):
@@ -291,11 +305,11 @@ def _detect_edge_density(gray_frame, grid_size=32, threshold_factor=0.1):
             cell = edges[y:y+grid_size, x:x+grid_size]
             edge_count = np.sum(cell > 0)
             total_pixels = cell.shape[0] * cell.shape[1]
-            
+
             # Calculate edge density
             if total_pixels > 0:
                 edge_density = edge_count / total_pixels
-                
+
                 # If edge density is above threshold, add a keypoint at the center of the cell
                 if edge_density > threshold_factor:
                     center_x = x + grid_size // 2
@@ -303,7 +317,51 @@ def _detect_edge_density(gray_frame, grid_size=32, threshold_factor=0.1):
                     # Use edge density as the keypoint size (normalized)
                     kp = cv2.KeyPoint(float(center_x), float(center_y), size=edge_density * 100)
                     keypoints.append(kp)
-    
+
+    return keypoints
+
+
+def _detect_temporal_difference(gray_frame, frame_history, frame_delay=1, threshold=30):
+    """Detect motion using temporal differencing (frame comparison)."""
+    # Add current frame to history
+    frame_history.append(gray_frame.copy())
+
+    keypoints = []
+
+    # Only proceed if we have enough frames for comparison
+    if len(frame_history) >= frame_delay:
+        # Get the reference frame (frame_delay steps ago)
+        reference_frame = frame_history[0]
+
+        # Get the current frame (most recent)
+        current_frame = frame_history[-1]
+
+        # Calculate absolute difference
+        diff_frame = cv2.absdiff(current_frame, reference_frame)
+
+        # Apply threshold to create binary motion mask
+        _, thresholded_diff = cv2.threshold(diff_frame, threshold, 255, cv2.THRESH_BINARY)
+
+        # Clean up the motion mask with morphological operations
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        thresholded_diff = cv2.morphologyEx(thresholded_diff, cv2.MORPH_OPEN, kernel)
+        thresholded_diff = cv2.morphologyEx(thresholded_diff, cv2.MORPH_CLOSE, kernel)
+
+        # Find contours in the motion mask
+        contours, _ = cv2.findContours(thresholded_diff, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area > 50:  # Filter out small motion regions
+                # Calculate the center of the contour
+                M = cv2.moments(contour)
+                if M["m00"] != 0:
+                    cx = int(M["m10"] / M["m00"])
+                    cy = int(M["m01"] / M["m00"])
+                    # Create a keypoint at the center of the motion region
+                    kp = cv2.KeyPoint(float(cx), float(cy), size=np.sqrt(area))
+                    keypoints.append(kp)
+
     return keypoints
 
 
@@ -392,6 +450,7 @@ def render_tracked_effect(
     ignore_audio: bool,
     video_threshold: float,
     line_distance: int,
+    line_stability: bool,
     curved_lines: bool,
     max_curvature: float,
     max_box_size: int | None,
@@ -412,6 +471,8 @@ def render_tracked_effect(
     color_upper_hsv: list[int],
     edge_density_threshold: float,
     edge_density_grid_size: int,
+    temporal_diff_delay: int,
+    temporal_diff_threshold: int,
 ):
     if seed is not None:
         random.seed(seed)
@@ -424,8 +485,8 @@ def render_tracked_effect(
 
         # Onset detection
         if ignore_audio or clip.audio is None or not LIBROSA_AVAILABLE:
-            logging.info("⚙️ Using video-based onset detection (threshold=%.2f)", video_threshold)
-            onset_times = _detect_onsets_video(clip, threshold=video_threshold)
+            logging.info("⚙️ Using time-based onset detection (interval=%.2f seconds)", video_threshold)
+            onset_times = _detect_onsets_time_based(clip, interval=video_threshold)
         else:
             wav_path = _extract_audio(video_in)
             onset_times = _detect_onsets_audio(wav_path)
@@ -438,11 +499,15 @@ def render_tracked_effect(
             detect_shadows = bg_sub_detect_shadows
             learning_rate = bg_sub_learning_rate if bg_sub_learning_rate > 0 else -1  # -1 for default
             bg_subtractor = cv2.createBackgroundSubtractorMOG2(detectShadows=detect_shadows, varThreshold=150)
+        elif detection_method == "td":  # temporal-difference
+            from collections import deque
+            frame_history = deque(maxlen=temporal_diff_delay)
         elif detection_method in ["contour", "hl", "hc", "dof", "cr", "ed"]:
             # These detection methods don't need initialization, we'll call the functions directly
             pass
         
         active, onset_idx, prev_gray = [], 0, None
+        active_connections = set()  # Track persistent line connections by point ID pairs
         color_mode_negative = isinstance(text_color, str) and text_color.lower() == "negative"
 
         def make_frame(t: float):
@@ -503,6 +568,10 @@ def render_tracked_effect(
                     kps = _detect_edge_density(gray, threshold_factor=edge_density_threshold, grid_size=edge_density_grid_size)
                     # Sort by keypoint size
                     kps = sorted(kps, key=lambda k: k.size if hasattr(k, 'size') else 0, reverse=True) if kps else []
+                elif detection_method == "td":  # temporal-difference
+                    kps = _detect_temporal_difference(gray, frame_history, frame_delay=temporal_diff_delay, threshold=temporal_diff_threshold)
+                    # Sort by keypoint size
+                    kps = sorted(kps, key=lambda k: k.size if hasattr(k, 'size') else 0, reverse=True) if kps else []
                 
                 for kp in kps[:random.randint(1, pts_per_beat)]:
                     # All detection methods now return KeyPoint objects with .pt attribute
@@ -525,34 +594,63 @@ def render_tracked_effect(
                         s = min(s, max_box_size)
                     active.append(TrackedPoint((x, y), life_frames, s, text_rate_ms))
 
-            # Line connections based on distance
+            # Update persistent line connections
             if line_distance > 0 and len(active) > 1:
+                active_ids = {tp.id for tp in active}  # Set of currently active point IDs
+
+                # Remove connections where both points are no longer active
+                active_connections_copy = active_connections.copy()
+                for conn in active_connections_copy:
+                    id1, id2 = conn
+                    if id1 not in active_ids and id2 not in active_ids:
+                        active_connections.discard(conn)
+
+                # Add new connections between close active points
                 coords = [tp.pos for tp in active]
-                for i, p in enumerate(coords):
-                    dists = sorted(
-                        [(j, np.linalg.norm(p - coords[j])) for j in range(len(coords)) if j != i],
-                        key=lambda x: x[1],
-                    )
-                    # Calculate dynamic distance threshold based on frame size (longest dimension)
-                    frame_max_dimension = max(frame_w, frame_h)
-                    
-                    # If line_distance is 10: connect to ALL points (not just neighbor_links closest)
-                    # If line_distance is between 1-9: connect based on distance threshold scaled as percentage of frame size
-                    # If line_distance is 0: no connections (handled by the if condition above)
-                    if line_distance >= 10:  # "all" behavior - connect to all possible points
-                        nearest = dists  # Connect to all points, not just neighbor_links
-                    else:  # Distance-based behavior - connect based on distance threshold
-                        distance_threshold = (line_distance / 10.0) * frame_max_dimension  # Scale as percentage of frame size
-                        nearest = [d for d in dists if d[1] < distance_threshold][:neighbor_links]
-                    
-                    for j, dist in nearest:
-                        if curved_lines:
-                            # Draw curved lines with random curvature
-                            start_point = tuple(p.astype(int))
-                            end_point = tuple(coords[j].astype(int))
-                            draw_curved_line(frame, start_point, end_point, dist, (200, 200, 255), 1, max_curvature)
-                        else:
-                            cv2.line(frame, tuple(p.astype(int)), tuple(coords[j].astype(int)), (200, 200, 255), 1)
+                point_id_to_pos = {tp.id: tp.pos for tp in active}
+
+                for i, tp1 in enumerate(active):
+                    for j, tp2 in enumerate(active):
+                        if i >= j:  # Avoid duplicate connections and self-connections
+                            continue
+
+                        dist = np.linalg.norm(tp1.pos - tp2.pos)
+                        frame_max_dimension = max(frame_w, frame_h)
+
+                        # Check if points should be connected based on distance
+                        should_connect = False
+                        if line_distance >= 100:  # "all" behavior
+                            should_connect = True
+                        else:  # Distance-based behavior
+                            distance_threshold = (line_distance / 100.0) * frame_max_dimension
+                            should_connect = dist < distance_threshold
+
+                        if should_connect:
+                            # Add connection as frozenset to ensure order doesn't matter
+                            connection = frozenset([tp1.id, tp2.id])
+                            active_connections.add(connection)
+
+            # Draw persistent line connections
+            for conn in active_connections:
+                id1, id2 = conn
+                # Find positions of both points (they should both be active if connection exists)
+                pos1 = None
+                pos2 = None
+                for tp in active:
+                    if tp.id == id1:
+                        pos1 = tp.pos
+                    elif tp.id == id2:
+                        pos2 = tp.pos
+
+                if pos1 is not None and pos2 is not None:
+                    dist = np.linalg.norm(pos1 - pos2)
+                    if curved_lines:
+                        # Draw curved lines with random curvature
+                        start_point = tuple(pos1.astype(int))
+                        end_point = tuple(pos2.astype(int))
+                        draw_curved_line(frame, start_point, end_point, dist, (200, 200, 255), 1, max_curvature)
+                    else:
+                        cv2.line(frame, tuple(pos1.astype(int)), tuple(pos2.astype(int)), (200, 200, 255), 1)
 
             # Draw boxes and text (if enabled)
             for tp in active:
@@ -592,6 +690,180 @@ def render_tracked_effect(
     logging.info("✅ Render complete: %s", video_out)
 
 
+def analyze_all_detection_methods(video_path: Path, sample_frames: int = 20, force_max: bool = False, pts_per_beat: int = 20, life_frames: int = 10, ambient_rate: float = 5.0, ignore_audio: bool = False, video_threshold: float = 1.0):
+    """Analyze all detection methods with maximum sensitivity settings and simulate actual box generation."""
+    mode_desc = "Maximum Sensitivity (Forced)" if force_max else "Maximum Sensitivity Settings"
+    print(f"🔍 Detection Method Analysis ({mode_desc})")
+    print(f"Video: {video_path.name}")
+
+    with VideoFileClip(str(video_path)) as clip:
+        clip = auto_orient_clip(clip, video_path)
+        total_frames = int(clip.fps * clip.duration)
+        sample_frames = min(max(1, sample_frames), min(100, total_frames))  # Clamp to reasonable range
+
+        print(f"Sampling {sample_frames} frames from {total_frames} total frames")
+        print()
+
+        # Onset detection for simulation
+        if ignore_audio or clip.audio is None or not LIBROSA_AVAILABLE:
+            print("⚙️ Using time-based onset detection (interval=%.2f seconds)" % video_threshold)
+            onset_times = _detect_onsets_time_based(clip, interval=video_threshold)
+        else:
+            wav_path = _extract_audio(video_path)
+            onset_times = _detect_onsets_audio(wav_path)
+        print(f"{len(onset_times)} onsets detected")
+
+        # Define maximum sensitivity settings for each method
+        max_settings = {
+            "orb": {"nfeatures": 1500, "fastThreshold": 1},
+            "contour": {"min_area": 1, "max_area": 10000},
+            "hl": {"threshold": 10, "min_line_length": 1, "max_line_gap": 1},
+            "hc": {"min_radius": 1, "max_radius": 100, "param1": 10, "param2": 5},
+            "bgs": {"learning_rate": 0.001, "detect_shadows": True},
+            "dof": {"threshold": 1.0},
+            "cr": {"lower_color": (0, 0, 0), "upper_color": (179, 255, 255), "min_area": 1},
+            "ed": {"threshold_factor": 0.01, "grid_size": 8},
+            "td": {"frame_delay": 1, "threshold": 5}
+        }
+
+        # Initialize background subtractor for BGS
+        bg_subtractor = cv2.createBackgroundSubtractorMOG2(detectShadows=True, varThreshold=150)
+
+        # Initialize temporal difference frame history
+        from collections import deque
+        frame_history = deque(maxlen=1)
+
+        method_names_display = {
+            "orb": "ORB Features",
+            "contour": "Contour Detection",
+            "hl": "Hough Lines",
+            "hc": "Hough Circles",
+            "bgs": "Background Subtraction",
+            "dof": "Dense Optical Flow",
+            "cr": "Color Range",
+            "ed": "Edge Density",
+            "td": "Temporal Difference"
+        }
+
+        results = {}
+
+        # For each detection method, simulate the full process
+        for method_name in ["orb", "contour", "hl", "hc", "bgs", "dof", "cr", "ed", "td"]:
+            print(f"⏳ Analyzing {method_names_display[method_name]}...")
+            total_keypoints = 0
+            total_boxes_spawned = 0
+            total_active_boxes = 0
+            
+            # Simulate the entire process for this method
+            active_points = []
+            onset_idx = 0
+            prev_gray = None
+
+            # Process each frame to detect keypoints and simulate box spawning
+            for frame_time in np.linspace(0, clip.duration, total_frames if force_max else sample_frames, endpoint=False):
+                frame = clip.get_frame(frame_time)
+                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+
+                settings = max_settings[method_name]
+
+                # Get keypoints for this method
+                if method_name == "orb":
+                    detector = cv2.ORB_create(nfeatures=settings["nfeatures"], fastThreshold=settings["fastThreshold"])
+                    keypoints = detector.detect(gray, None)
+                elif method_name == "contour":
+                    keypoints = _detect_contours(gray, min_area=settings["min_area"], max_area=settings["max_area"])
+                elif method_name == "hl":
+                    keypoints = _detect_hough_lines(gray, threshold=settings["threshold"],
+                                                   min_line_length=settings["min_line_length"],
+                                                   max_line_gap=settings["max_line_gap"])
+                elif method_name == "hc":
+                    keypoints = _detect_hough_circles(gray, min_radius=settings["min_radius"],
+                                                     max_radius=settings["max_radius"],
+                                                     param1=settings["param1"], param2=settings["param2"])
+                elif method_name == "bgs":
+                    keypoints = _detect_background_subtraction(gray, bg_subtractor)
+                elif method_name == "dof":
+                    if prev_gray is not None:
+                        keypoints = _detect_dense_optical_flow(prev_gray, gray, threshold=settings["threshold"])
+                    else:
+                        keypoints = []
+                elif method_name == "cr":
+                    keypoints = _detect_color_range(frame_bgr, lower_color=settings["lower_color"],
+                                                   upper_color=settings["upper_color"], min_area=settings["min_area"])
+                elif method_name == "ed":
+                    keypoints = _detect_edge_density(gray, threshold_factor=settings["threshold_factor"],
+                                                   grid_size=settings["grid_size"])
+                elif method_name == "td":
+                    keypoints = _detect_temporal_difference(gray, frame_history,
+                                                          frame_delay=settings["frame_delay"],
+                                                          threshold=settings["threshold"])
+
+                # Count total keypoints found
+                total_keypoints += len(keypoints) if keypoints else 0
+
+                # Simulate spawning boxes on onsets
+                while onset_idx < len(onset_times) and frame_time >= onset_times[onset_idx]:
+                    if keypoints:
+                        # Simulate the same logic as in the main rendering function
+                        # Sort keypoints by response/size if available
+                        if method_name in ["contour", "hl", "hc", "bgs", "dof", "cr", "ed", "td"]:
+                            # Sort by keypoint size/response if available
+                            keypoints = sorted(keypoints, key=lambda k: k.size if hasattr(k, 'size') else 0, reverse=True) if keypoints else []
+                        # Spawn points from detected keypoints, similar to the main function
+                        num_points_to_spawn = random.randint(1, pts_per_beat)
+                        for kp in keypoints[:num_points_to_spawn]:
+                            x, y = kp.pt
+                            x, y = float(x), float(y)
+                            # Only add if not too close to an existing point
+                            if all(np.linalg.norm(tp.pos - (x, y)) >= 10 for tp in active_points):
+                                # Create a simulated TrackedPoint
+                                active_points.append(TrackedPoint((x, y), life_frames, _sample_size_bell(15, 40, 4.0)))
+                                total_boxes_spawned += 1
+                    
+                    onset_idx += 1
+
+                # Simulate ambient points
+                if ambient_rate > 0:
+                    for _ in range(np.random.poisson(ambient_rate / clip.fps)):
+                        x, y = random.uniform(0, gray.shape[1]), random.uniform(0, gray.shape[0])  # Use frame dimensions
+                        s = _sample_size_bell(15, 40, 4.0)
+                        active_points.append(TrackedPoint((x, y), life_frames, s))
+                        total_boxes_spawned += 1
+
+                # Update active points: reduce life and remove dead ones
+                active_points = [tp for tp in active_points if tp.life > 0]
+                for tp in active_points:
+                    tp.life -= 1
+                
+                total_active_boxes += len(active_points)
+                prev_gray = gray
+
+            # Store results for this method
+            results[method_name] = {
+                'keypoints': total_keypoints,
+                'boxes_spawned': total_boxes_spawned,
+                'avg_active_boxes': total_active_boxes / (total_frames if force_max else sample_frames) if (total_frames if force_max else sample_frames) > 0 else 0
+            }
+            
+            print(f"   ✓ Found {total_keypoints} keypoints, spawned {total_boxes_spawned} boxes")
+
+        # Display results in a formatted table
+        print("\nDetection Method Analysis Results:")
+        print("-" * 80)
+        print(f"{'Method':<20} | {'Keypoints':>9} | {'Boxes Spawned':>12} | {'Avg Active':>10}")
+        print("-" * 80)
+
+        for method, counts in results.items():
+            print(f"{method_names_display[method]:<20} | {counts['keypoints']:>9,} | {counts['boxes_spawned']:>12,} | {counts['avg_active_boxes']:>10.1f}")
+
+        print("-" * 80)
+        print("💡 Keypoints: Raw features detected by each method")
+        print("💡 Boxes Spawned: Potential boxes that would be created during actual rendering")
+        print("💡 Avg Active: Average number of boxes visible simultaneously")
+        print("💡 Higher box generation counts indicate methods that work well for this video content.")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Render onset-tracked video effects with motion, text, and visual options.",
@@ -606,32 +878,39 @@ def main():
     parser.add_argument("-r", "--remove-text", action="store_true", help="Remove text overlay entirely")
     parser.add_argument("-n", "--no-fill", action="store_true", help="Disable box inversion fill")
     parser.add_argument("-a", "--ignore-audio", action="store_true", help="Ignore audio and use video intensity threshold")
-    parser.add_argument("-vth", "--video-threshold", type=float, default=1.0, help="Video intensity change threshold")
+    parser.add_argument("-th", "--threshold", type=float, default=1.0, help="Time interval between onsets (seconds) when --ignore-audio is used")
+    parser.add_argument("-ld", "--life-duration", type=float, default=333.0, help="Duration in milliseconds that tracked points remain active (333ms = ~10 frames at 30fps)")
     parser.add_argument("-l", "--line-distance", type=int, default=80,
                         help="Distance threshold for connecting points (0 for none, higher values for larger distances)")
+    parser.add_argument("--line-stability", action="store_true", help="Enable stable line connections that persist even when points move (reduces blinking)")
     parser.add_argument("--curved-lines", action="store_true", help="Enable curved lines with distance-based curvature")
     parser.add_argument("--max-curvature", type=float, default=0.5, help="Maximum curvature for curved lines (0.0 to 1.0)")
     parser.add_argument("-m", "--max-box-size", type=int, default=None, help="Set maximum box size (override)")
-    parser.add_argument("--detection-method", type=str, default="orb", choices=["orb", "contour", "hl", "hc", "bgs", "dof", "cr", "ed"], 
-                        help="Detection method: 'orb' (default) for ORB feature detection, 'contour' for contour detection, 'hl' for Hough line detection, 'hc' for Hough circle detection, 'bgs' for background subtraction, 'dof' for dense optical flow, 'cr' for color-based detection, 'ed' for edge density detection")
+    parser.add_argument("--detection-method", type=str, default="orb", choices=["orb", "contour", "hl", "hc", "bgs", "dof", "cr", "ed", "td"],
+                        help="Detection method: 'orb' (default) for ORB feature detection, 'contour' for contour detection, 'hl' for Hough line detection, 'hc' for Hough circle detection, 'bgs' for background subtraction, 'dof' for dense optical flow, 'cr' for color-based detection, 'ed' for edge density detection, 'td' for temporal difference motion detection")
     
     # Detection method specific parameters
-    parser.add_argument("--contour-min-area", type=int, default=50, help="Minimum contour area for contour detection")
-    parser.add_argument("--contour-max-area", type=int, default=5000, help="Maximum contour area for contour detection")
-    parser.add_argument("--hough-lines-threshold", type=int, default=100, help="Threshold parameter for Hough lines detection")
-    parser.add_argument("--hough-lines-min-length", type=int, default=30, help="Minimum line length for Hough lines detection")
-    parser.add_argument("--hough-lines-max-gap", type=int, default=10, help="Maximum gap between line segments for Hough lines detection")
-    parser.add_argument("--hough-circles-min-radius", type=int, default=10, help="Minimum circle radius for Hough circles detection")
-    parser.add_argument("--hough-circles-max-radius", type=int, default=50, help="Maximum circle radius for Hough circles detection")
-    parser.add_argument("--hough-circles-param1", type=int, default=50, help="Parameter 1 for Hough circles detection")
-    parser.add_argument("--hough-circles-param2", type=int, default=30, help="Parameter 2 for Hough circles detection")
-    parser.add_argument("--bg-sub-learning-rate", type=float, default=0.0, help="Learning rate for background subtraction (0.0 = auto)")
-    parser.add_argument("--bg-sub-detect-shadows", action="store_true", help="Enable shadow detection for background subtraction")
-    parser.add_argument("--optical-flow-threshold", type=float, default=15.0, help="Motion threshold for dense optical flow detection")
-    parser.add_argument("--color-lower-hsv", type=int, nargs=3, default=[0, 50, 50], help="Lower HSV bounds for color detection [H, S, V]")
-    parser.add_argument("--color-upper-hsv", type=int, nargs=3, default=[10, 255, 255], help="Upper HSV bounds for color detection [H, S, V]")
-    parser.add_argument("--edge-density-threshold", type=float, default=0.1, help="Edge density threshold factor")
-    parser.add_argument("--edge-density-grid-size", type=int, default=32, help="Grid cell size for edge density analysis")
+    parser.add_argument("--ct-min-area", type=int, default=50, help="Minimum contour area for contour detection")
+    parser.add_argument("--ct-max-area", type=int, default=5000, help="Maximum contour area for contour detection")
+    parser.add_argument("--hl-threshold", type=int, default=100, help="Threshold parameter for Hough lines detection")
+    parser.add_argument("--hl-min-length", type=int, default=30, help="Minimum line length for Hough lines detection")
+    parser.add_argument("--hl-max-gap", type=int, default=10, help="Maximum gap between line segments for Hough lines detection")
+    parser.add_argument("--hc-min-radius", type=int, default=10, help="Minimum circle radius for Hough circles detection")
+    parser.add_argument("--hc-max-radius", type=int, default=50, help="Maximum circle radius for Hough circles detection")
+    parser.add_argument("--hc-param1", type=int, default=50, help="Parameter 1 for Hough circles detection")
+    parser.add_argument("--hc-param2", type=int, default=30, help="Parameter 2 for Hough circles detection")
+    parser.add_argument("--bgs-learning-rate", type=float, default=0.0, help="Learning rate for background subtraction (0.0 = auto)")
+    parser.add_argument("--bgs-detect-shadows", action="store_true", help="Enable shadow detection for background subtraction")
+    parser.add_argument("--dof-threshold", type=float, default=15.0, help="Motion threshold for dense optical flow detection")
+    parser.add_argument("--cr-lower-hsv", type=int, nargs=3, default=[0, 50, 50], help="Lower HSV bounds for color detection [H, S, V]")
+    parser.add_argument("--cr-upper-hsv", type=int, nargs=3, default=[10, 255, 255], help="Upper HSV bounds for color detection [H, S, V]")
+    parser.add_argument("--ed-threshold", type=float, default=0.1, help="Edge density threshold factor")
+    parser.add_argument("--ed-grid-size", type=int, default=32, help="Grid cell size for edge density analysis")
+    parser.add_argument("--td-delay", type=int, default=1, help="Frame delay for temporal difference motion detection (1 = fast movements, higher = slow movements)")
+    parser.add_argument("--td-threshold", type=int, default=30, help="Threshold for temporal difference motion detection")
+    parser.add_argument("-va", "--verbose-all", action="store_true", help="Analyze all detection methods with maximum sensitivity (no video output)")
+    parser.add_argument("--sample-frames", type=int, default=20, help="Number of frames to sample for --verbose-all analysis (1-100)")
+    parser.add_argument("--max", action="store_true", help="Force maximum sensitivity for all detection methods (overrides other settings)")
 
     args = parser.parse_args()
 
@@ -649,6 +928,27 @@ def main():
         logging.warning("⚠️ Librosa not available. Audio-based onset detection will be disabled.")
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+    # Convert life duration from milliseconds to frames
+    with VideoFileClip(str(args.input)) as temp_clip:
+        temp_clip = auto_orient_clip(temp_clip, Path(args.input))
+        fps = temp_clip.fps
+        life_frames = max(1, int((args.life_duration / 1000.0) * fps))  # Convert ms to frames, minimum 1 frame
+
+    # Handle verbose-all analysis mode
+    if args.verbose_all:
+        analyze_all_detection_methods(
+            video_path=Path(args.input),
+            sample_frames=args.sample_frames,
+            force_max=args.max,
+            pts_per_beat=20,
+            life_frames=life_frames,
+            ambient_rate=5.0,
+            ignore_audio=args.ignore_audio,
+            video_threshold=args.threshold
+        )
+        return
+
     render_tracked_effect(
         video_in=Path(args.input),
         video_out=Path(args.output),
@@ -656,7 +956,7 @@ def main():
         pts_per_beat=20,
         ambient_rate=5.0,
         jitter_px=0.5,
-        life_frames=10,
+        life_frames=life_frames,
         min_size=15,
         max_size=40,
         neighbor_links=3,
@@ -669,28 +969,31 @@ def main():
         remove_text=args.remove_text,
         no_fill=args.no_fill,
         ignore_audio=args.ignore_audio,
-        video_threshold=args.video_threshold,
+        video_threshold=args.threshold,
         line_distance=args.line_distance,
+        line_stability=args.line_stability,
         curved_lines=args.curved_lines,
         max_curvature=args.max_curvature,
         max_box_size=args.max_box_size,
         detection_method=args.detection_method,
-        contour_min_area=args.contour_min_area,
-        contour_max_area=args.contour_max_area,
-        hough_lines_threshold=args.hough_lines_threshold,
-        hough_lines_min_length=args.hough_lines_min_length,
-        hough_lines_max_gap=args.hough_lines_max_gap,
-        hough_circles_min_radius=args.hough_circles_min_radius,
-        hough_circles_max_radius=args.hough_circles_max_radius,
-        hough_circles_param1=args.hough_circles_param1,
-        hough_circles_param2=args.hough_circles_param2,
-        bg_sub_learning_rate=args.bg_sub_learning_rate,
-        bg_sub_detect_shadows=args.bg_sub_detect_shadows,
-        optical_flow_threshold=args.optical_flow_threshold,
-        color_lower_hsv=args.color_lower_hsv,
-        color_upper_hsv=args.color_upper_hsv,
-        edge_density_threshold=args.edge_density_threshold,
-        edge_density_grid_size=args.edge_density_grid_size,
+        contour_min_area=args.ct_min_area,
+        contour_max_area=args.ct_max_area,
+        hough_lines_threshold=args.hl_threshold,
+        hough_lines_min_length=args.hl_min_length,
+        hough_lines_max_gap=args.hl_max_gap,
+        hough_circles_min_radius=args.hc_min_radius,
+        hough_circles_max_radius=args.hc_max_radius,
+        hough_circles_param1=args.hc_param1,
+        hough_circles_param2=args.hc_param2,
+        bg_sub_learning_rate=args.bgs_learning_rate,
+        bg_sub_detect_shadows=args.bgs_detect_shadows,
+        optical_flow_threshold=args.dof_threshold,
+        color_lower_hsv=args.cr_lower_hsv,
+        color_upper_hsv=args.cr_upper_hsv,
+        edge_density_threshold=args.ed_threshold,
+        edge_density_grid_size=args.ed_grid_size,
+        temporal_diff_delay=args.td_delay,
+        temporal_diff_threshold=args.td_threshold,
     )
 
 
