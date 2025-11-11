@@ -23,7 +23,7 @@ def _extract_audio(video_path: Path, sr: int = 22050) -> Path:
     with VideoFileClip(str(video_path)) as clip:
         if clip.audio is None:
             raise ValueError("No audio track found in the video.")
-        clip.audio.write_audiofile(str(wav_path), fps=sr, logger=None, verbose=False)
+        clip.audio.write_audiofile(str(wav_path), fps=sr, logger=None)
     return wav_path
 
 
@@ -61,10 +61,13 @@ def get_rotation(path: Path) -> int:
 
 
 class TrackedPoint:
-    def __init__(self, pos: tuple[float, float], life: int, size: int):
+    def __init__(self, pos: tuple[float, float], life: int, size: int, text_rate_ms: float = 0):
         self.pos = np.array(pos, dtype=np.float32)
         self.life = life
         self.size = size
+        self.text_rate_ms = text_rate_ms  # Text change rate in milliseconds
+        self.last_text_update = 0  # Track time of last text update
+        self.current_text = f"0x{random.randint(0, 0xFFFFFFFF):08X}"  # Current text
 
 
 def _sample_size_bell(min_s: int, max_s: int, width_div: float = 6.0) -> int:
@@ -383,6 +386,7 @@ def render_tracked_effect(
     seed: int | None,
     text_size: float,
     text_color: str | tuple[int, int, int],
+    text_rate_ms: float,
     remove_text: bool,
     no_fill: bool,
     ignore_audio: bool,
@@ -509,7 +513,7 @@ def render_tracked_effect(
                         s = _sample_size_bell(min_size, max_size, bell_width)
                         if max_box_size:
                             s = min(s, max_box_size)
-                        active.append(TrackedPoint((x, y), life_frames, s))
+                        active.append(TrackedPoint((x, y), life_frames, s, text_rate_ms))
                 onset_idx += 1
 
             # Ambient points
@@ -519,7 +523,7 @@ def render_tracked_effect(
                     s = _sample_size_bell(min_size, max_size, bell_width)
                     if max_box_size:
                         s = min(s, max_box_size)
-                    active.append(TrackedPoint((x, y), life_frames, s))
+                    active.append(TrackedPoint((x, y), life_frames, s, text_rate_ms))
 
             # Line connections based on distance
             if line_distance > 0 and len(active) > 1:
@@ -568,7 +572,13 @@ def render_tracked_effect(
                     else:
                         txt_color = text_color
 
-                    hex_text = f"0x{random.randint(0, 0xFFFFFFFF):08X}"
+                    # Update text based on text_rate_ms
+                    current_time_ms = t * 1000  # Convert frame time from seconds to milliseconds
+                    if tp.text_rate_ms > 0 and (current_time_ms - tp.last_text_update) >= tp.text_rate_ms:
+                        tp.current_text = f"0x{random.randint(0, 0xFFFFFFFF):08X}"
+                        tp.last_text_update = current_time_ms
+                    
+                    hex_text = tp.current_text
                     text_pos = (br[0] + 5, min(br[1], h - 10))
                     cv2.putText(frame, hex_text, text_pos, cv2.FONT_HERSHEY_SIMPLEX, text_size, txt_color, 1, cv2.LINE_AA)
 
@@ -592,6 +602,7 @@ def main():
     parser.add_argument("-t", "--text-size", type=float, default=0.4, help="Hex text size")
     parser.add_argument("-c", "--text-color", nargs="+", default=(255, 255, 255),
                         help='Text color (B G R) or "negative" for adaptive auto-contrast')
+    parser.add_argument("-tr", "--text-rate", type=float, default=0.0, help="Text change rate in milliseconds (0 = change every frame)")
     parser.add_argument("-r", "--remove-text", action="store_true", help="Remove text overlay entirely")
     parser.add_argument("-n", "--no-fill", action="store_true", help="Disable box inversion fill")
     parser.add_argument("-a", "--ignore-audio", action="store_true", help="Ignore audio and use video intensity threshold")
@@ -654,6 +665,7 @@ def main():
         seed=None,
         text_size=args.text_size,
         text_color=text_color,
+        text_rate_ms=args.text_rate,
         remove_text=args.remove_text,
         no_fill=args.no_fill,
         ignore_audio=args.ignore_audio,

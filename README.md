@@ -3,7 +3,7 @@ BlobTrack is a simple Python-based implementation of blob tracking for videos, m
 The script supports:
 - 🧭 **Auto orientation** for portrait and landscape videos
 - 🎵 **Audio or video-based onset detection**
-- ✨ **Customizable text, color, and size**
+- ✨ **Customizable text, color, size, and change rate**
 - 🔗 **Adjustable connection line modes**
 - 🔲 **Configurable box size, life span, and behavior**
 - 🔍 **Multiple detection methods** (ORB, Contour, Hough, Background Subtraction, Optical Flow, Color, Edge Density)
@@ -21,6 +21,7 @@ The script supports:
 | 🧮 Box customization | Control maximum size, lifespan, and spawn rate |
 | 🧾 Text overlays | Displays random 8-digit hexadecimal codes beside boxes |
 | 🌓 Adaptive colors | `--text-color negative` makes text contrast auto-fit each box region |
+| ⏱️ Configurable text rate | `--text-rate` controls how frequently the hex text changes, in milliseconds |
 | ⚡ Lightweight CLI | Fast, no GUI required — works directly in terminal |
 | ✨ Curved lines | Enable curved connections with configurable maximum curvature |
 | 🔗 Distance-based connections | Control connections based on distance with automatic scaling |
@@ -76,6 +77,7 @@ python3 main.py -i input.mp4 -o output.mp4
 | `-t`   | `--text-size`       | `0.4`         | Size of the random hexadecimal text                            |
 | `-r`   | `--remove-text`     | *(flag)*      | Remove text entirely                                           |
 | `-c`   | `--text-color`      | `255 255 255` | Text color in B G R format, or `"negative"` for adaptive color |
+| `-tr`  | `--text-rate`       | `0.0`         | Text change rate in milliseconds (0 = change every frame)      |
 | `-n`   | `--no-fill`         | *(flag)*      | Disable box inversion (transparent boxes)                      |
 | `-a`   | `--ignore-audio`    | *(flag)*      | Ignore audio; use video intensity changes instead              |
 | `-vth` | `--video-threshold` | `1.0`         | Sensitivity for motion detection; higher = less sensitive      |
@@ -151,6 +153,12 @@ python3 main.py --detection-method cr --color-lower-hsv 0 50 50 --color-upper-hs
 
 ```bash
 python3 main.py --detection-method bgs --bg-sub-detect-shadows -i input.mp4 -o output.mp4
+```
+
+### ⏱️ Control Text Change Rate
+
+```bash
+python3 main.py --text-rate 500 -i input.mp4 -o output.mp4  # Change text every 500ms
 ```
 
 ---
